@@ -18,6 +18,8 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
     var onConnected: (() -> Void)?
     var onError: ((String) -> Void)?
 
+    var isConnected: Bool { identified }
+
     init(host: String, port: Int, password: String) {
         self.host = host
         self.port = port

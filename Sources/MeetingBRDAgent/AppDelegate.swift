@@ -12,9 +12,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private var pipeline: Pipeline!
 
     private var isRecording = false
+    private var lastNotifiedStatus: String?
+    /// Set when a recording was requested but OBS wasn't connected yet — fulfilled
+    /// once `obs.onConnected` fires, instead of silently dropping the start command.
+    private var pendingRecordingStart = false
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         pipeline = Pipeline(config: config)
+        OBSLauncher.launchIfNeeded()
         setupStatusItem()
         setupOBS()
         setupWindowWatcher()
@@ -71,7 +76,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     private func setStatus(_ text: String) {
         DispatchQueue.main.async { [weak self] in
-            self?.statusMenuItem.title = text
+            guard let self else { return }
+            self.statusMenuItem.title = text
+            // Dedup so a repeated identical message (e.g. the OBS reconnect loop
+            // retrying every 5s while OBS is down) doesn't spam the notification center.
+            guard text != self.lastNotifiedStatus else { return }
+            self.lastNotifiedStatus = text
+            Notifier.send("MeetingBRDAgent", text)
         }
     }
 
@@ -80,8 +91,18 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         statusItem.button?.title = "🔴"
         startItem.isEnabled = false
         stopItem.isEnabled = true
-        setStatus("Запись идёт…")
-        obs.startRecording()
+
+        if obs.isConnected {
+            setStatus("Запись идёт…")
+            obs.startRecording()
+        } else {
+            // OBS got closed since launch (or hasn't finished starting yet) — relaunch it
+            // and defer the actual StartRecord until obs.onConnected fires, instead of
+            // showing 🔴 with nothing actually being recorded.
+            pendingRecordingStart = true
+            setStatus("OBS не запущен, открываю и жду подключения…")
+            OBSLauncher.launchIfNeeded()
+        }
     }
 
     // MARK: - OBS
@@ -89,7 +110,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func setupOBS() {
         obs = OBSClient(host: config.obsHost, port: config.obsPort, password: config.obsPassword)
         obs.onConnected = { [weak self] in
-            self?.setStatus("Подключено к OBS. Ожидание встречи…")
+            guard let self else { return }
+            if self.pendingRecordingStart {
+                self.pendingRecordingStart = false
+                self.setStatus("Запись идёт…")
+                self.obs.startRecording()
+            } else {
+                self.setStatus("Подключено к OBS. Ожидание встречи…")
+            }
         }
         obs.onError = { [weak self] message in
             self?.setStatus("OBS: \(message)")
