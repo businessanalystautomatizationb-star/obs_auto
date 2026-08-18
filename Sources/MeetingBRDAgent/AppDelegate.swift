@@ -19,7 +19,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     func applicationDidFinishLaunching(_ notification: Notification) {
         pipeline = Pipeline(config: config)
-        OBSLauncher.launchIfNeeded()
+        // OBS is launched lazily, only when a meeting is actually detected (see
+        // beginRecording()) — no point keeping it running from login until whenever the
+        // first call of the day happens.
         setupStatusItem()
         setupOBS()
         setupWindowWatcher()
@@ -96,12 +98,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             setStatus("Запись идёт…")
             obs.startRecording()
         } else {
-            // OBS got closed since launch (or hasn't finished starting yet) — relaunch it
-            // and defer the actual StartRecord until obs.onConnected fires, instead of
-            // showing 🔴 with nothing actually being recorded.
+            // OBS isn't running (or isn't connected yet) — launch/connect now and defer
+            // the actual StartRecord until obs.onConnected fires, instead of showing 🔴
+            // with nothing actually being recorded.
             pendingRecordingStart = true
             setStatus("OBS не запущен, открываю и жду подключения…")
             OBSLauncher.launchIfNeeded()
+            obs.connect()
         }
     }
 
@@ -134,7 +137,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
                 self?.setStatus(message)
             }
         }
-        obs.connect()
+        // No obs.connect() here — connecting (and launching OBS) happens lazily in
+        // beginRecording() once a meeting is actually detected, so the agent doesn't sit
+        // there retrying a websocket connection every 5s for hours with nothing to record.
     }
 
     // MARK: - Meeting detection
