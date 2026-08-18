@@ -128,7 +128,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.statusItem.button?.title = "🟡"
             self.startItem.isEnabled = true
             self.stopItem.isEnabled = false
-            self.setStatus("Запись сохранена, запускаю обработку…")
+            self.setStatus("Запись сохранена, закрываю OBS и запускаю обработку…")
+            OBSLauncher.quit()
             self.pipeline.run(recordingPath: path) { [weak self] message in
                 self?.setStatus(message)
             }

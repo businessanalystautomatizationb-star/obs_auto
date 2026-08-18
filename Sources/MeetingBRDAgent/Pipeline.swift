@@ -42,11 +42,20 @@ final class Pipeline {
 
         let process = Process()
         process.executableURL = URL(fileURLWithPath: try which("ffmpeg"))
+        // Mono/16kHz/64kbps — plenty for speech-to-text (Deepgram et al. train on 16kHz),
+        // and a much smaller upload than the original stereo/128kbps. A large meeting
+        // recording over a slow/VPN-throttled connection was hitting Deepgram's upload
+        // timeout (HTTP 408 SLOW_UPLOAD) at the previous size.
         process.arguments = [
-            "-y", "-i", videoPath,
-            "-vn", "-acodec", "aac", "-b:a", "128k",
+            "-y", "-nostdin", "-i", videoPath,
+            "-vn", "-acodec", "aac", "-ac", "1", "-ar", "16000", "-b:a", "64k",
             audioPath
         ]
+        // Without an explicit stdin, ffmpeg can block waiting for terminal input when run
+        // from a background/non-interactive process (as happens via LaunchAgent) — hangs
+        // indefinitely with 0% CPU instead of failing. -nostdin plus a null stdin closes
+        // that off completely.
+        process.standardInput = FileHandle.nullDevice
         let stderrPipe = Pipe()
         process.standardError = stderrPipe
         try process.run()
@@ -94,8 +103,7 @@ final class Pipeline {
         request.setValue("audio/mp4", forHTTPHeaderField: "Content-Type")
         request.httpBody = data
 
-        let (respData, response) = try syncRequest(request)
-        try checkHTTP(response, respData, context: "Deepgram transcribe")
+        let respData = try requestWithRetry(request, context: "Deepgram transcribe")
         let json = try JSONSerialization.jsonObject(with: respData) as? [String: Any]
         return try formatDeepgramTranscript(json)
     }
@@ -121,6 +129,10 @@ final class Pipeline {
     private func analyze(transcript: String) throws -> String {
         var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
         request.httpMethod = "POST"
+        // Long transcripts mean a long generation time; the default 60s request timeout
+        // (and some VPNs' idle-connection cutoff) can kill the request before Claude
+        // finishes responding — same fix as the Deepgram request below.
+        request.timeoutInterval = 3600
         request.setValue(config.anthropicKey, forHTTPHeaderField: "x-api-key")
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
@@ -133,12 +145,19 @@ final class Pipeline {
         ]
         request.httpBody = try JSONSerialization.data(withJSONObject: body)
 
-        let (respData, response) = try syncRequest(request)
-        try checkHTTP(response, respData, context: "Claude analyze")
+        let respData = try requestWithRetry(request, context: "Claude analyze")
         let json = try JSONSerialization.jsonObject(with: respData) as? [String: Any]
+
+        if let stopReason = json?["stop_reason"] as? String, stopReason == "refusal" {
+            throw PipelineError.step("Claude отказался анализировать этот транскрипт (stop_reason: refusal)")
+        }
+        // Sonnet 5 thinks by default, so content[] often starts with a "thinking" block
+        // before the "text" block — find the text block by type, don't assume it's first.
         guard let content = json?["content"] as? [[String: Any]],
-              let text = content.first?["text"] as? String else {
-            throw PipelineError.step("Claude response missing content text")
+              let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
+              let text = textBlock["text"] as? String else {
+            let raw = String(data: respData, encoding: .utf8) ?? "<non-utf8 body>"
+            throw PipelineError.step("Claude response missing content text — raw response: \(raw)")
         }
         return text
     }
@@ -160,6 +179,7 @@ final class Pipeline {
             let process = Process()
             process.executableURL = URL(fileURLWithPath: pandoc)
             process.arguments = [mdPath, "-o", docxPath]
+            process.standardInput = FileHandle.nullDevice
             try? process.run()
             process.waitUntilExit()
             if process.terminationStatus == 0, fm.fileExists(atPath: docxPath) {
@@ -171,7 +191,44 @@ final class Pipeline {
 
     // MARK: - HTTP helpers
 
-    private func syncRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
+    /// Retries a handful of times, with backoff, on both transport-level failures (dropped
+    /// connection, timeout, DNS hiccup — what a flaky VPN produces mid-upload) and specific
+    /// retryable HTTP status codes (408 request-timeout — e.g. Deepgram's SLOW_UPLOAD on a
+    /// throttled connection — 429, and 5xx). Other HTTP error codes are not retried.
+    private func requestWithRetry(_ request: URLRequest, context: String, maxAttempts: Int = 4) throws -> Data {
+        let retryableURLErrorCodes: Set<Int> = [
+            NSURLErrorNetworkConnectionLost,
+            NSURLErrorTimedOut,
+            NSURLErrorNotConnectedToInternet,
+            NSURLErrorCannotConnectToHost,
+            NSURLErrorCannotFindHost,
+            NSURLErrorDNSLookupFailed
+        ]
+        let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
+
+        var attempt = 1
+        while true {
+            do {
+                let (data, response) = try singleRequest(request)
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 200
+                if !(200...299).contains(statusCode), retryableHTTPStatusCodes.contains(statusCode), attempt < maxAttempts {
+                    Thread.sleep(forTimeInterval: Double(attempt) * 5) // 5s, 10s, 15s
+                    attempt += 1
+                    continue
+                }
+                try checkHTTP(response, data, context: context)
+                return data
+            } catch {
+                let nsError = error as NSError
+                let retryable = nsError.domain == NSURLErrorDomain && retryableURLErrorCodes.contains(nsError.code)
+                guard retryable, attempt < maxAttempts else { throw error }
+                Thread.sleep(forTimeInterval: Double(attempt) * 5)
+                attempt += 1
+            }
+        }
+    }
+
+    private func singleRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
         var result: Result<(Data, URLResponse), Error>!
         let semaphore = DispatchSemaphore(value: 0)
         URLSession.shared.dataTask(with: request) { data, response, error in
