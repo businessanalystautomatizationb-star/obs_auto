@@ -233,11 +233,34 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             OBSLauncher.quit()
             self.pipeline.run(recordingPath: path) { [weak self] message in
                 self?.setStatus(message)
+                if message.hasPrefix("Готово: ") {
+                    self?.offerProjectHub(docPath: String(message.dropFirst("Готово: ".count)))
+                }
             }
         }
         // No obs.connect() here — connecting (and launching OBS) happens lazily in
         // beginRecording() once a meeting is actually detected, so the agent doesn't sit
         // there retrying a websocket connection every 5s for hours with nothing to record.
+    }
+
+    /// Project Hub (~/Проекты/project-hub, автозапуск через LaunchAgent) разбирает протокол
+    /// в задачи по проекту; ?doc= — имя файла в MeetingDocs, проект выбирается там же.
+    private func offerProjectHub(docPath: String) {
+        let name = (docPath as NSString).lastPathComponent
+        // The hub runs under launchd and can't read ~/Documents (macOS privacy) — hand it a copy.
+        let inbox = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Проекты/project-hub/inbox")
+        try? FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
+        let copy = inbox.appendingPathComponent(name)
+        try? FileManager.default.removeItem(at: copy)
+        try? FileManager.default.copyItem(at: URL(fileURLWithPath: docPath), to: copy)
+        var components = URLComponents(string: "http://127.0.0.1:8765/")!
+        components.queryItems = [URLQueryItem(name: "doc", value: name)]
+        guard let url = components.url else { return }
+        Alarm.offer("Встреча обработана",
+                    "Протокол готов: \(name).\nРазобрать его в Project Hub — задачи по людям, решения, черновики писем?",
+                    actionTitle: "Разобрать в Project Hub") {
+            NSWorkspace.shared.open(url)
+        }
     }
 
     // MARK: - Meeting detection

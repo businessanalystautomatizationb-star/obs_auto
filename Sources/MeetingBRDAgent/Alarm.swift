@@ -11,7 +11,18 @@ enum Alarm {
         DispatchQueue.main.async {
             Notifier.send("⚠️ \(title)", message)
             playSound(times: 3)
-            showPanel(title, message)
+            closer.action = nil
+            showPanel("⚠️ \(title)", message)
+        }
+    }
+
+    /// Quiet variant: same always-on-top panel, no sound, plus an action button
+    /// (e.g. "Разобрать в Project Hub" once a meeting has been processed).
+    static func offer(_ title: String, _ message: String, actionTitle: String, action: @escaping () -> Void) {
+        DispatchQueue.main.async {
+            Notifier.send(title, message)
+            closer.action = action
+            showPanel(title, message, actionTitle: actionTitle)
         }
     }
 
@@ -30,21 +41,28 @@ enum Alarm {
         }
     }
 
-    private static func showPanel(_ title: String, _ message: String) {
+    private static func showPanel(_ title: String, _ message: String, actionTitle: String? = nil) {
         panel?.orderOut(nil)
 
-        let titleLabel = NSTextField(labelWithString: "⚠️ \(title)")
+        let titleLabel = NSTextField(labelWithString: title)
         titleLabel.font = .boldSystemFont(ofSize: 20)
-        titleLabel.textColor = .systemRed
+        titleLabel.textColor = actionTitle == nil ? .systemRed : .labelColor
 
         let messageLabel = NSTextField(wrappingLabelWithString: message)
         messageLabel.font = .systemFont(ofSize: 14)
         messageLabel.preferredMaxLayoutWidth = 420
 
-        let button = NSButton(title: "Понятно", target: closer, action: #selector(Closer.close))
-        button.keyEquivalent = "\r"
+        let button = NSButton(title: actionTitle == nil ? "Понятно" : "Позже", target: closer, action: #selector(Closer.close))
+        var buttons = [button]
+        if let actionTitle {
+            let actionButton = NSButton(title: actionTitle, target: closer, action: #selector(Closer.runAction))
+            actionButton.keyEquivalent = "\r"
+            buttons.insert(actionButton, at: 0)
+        } else {
+            button.keyEquivalent = "\r"
+        }
 
-        let stack = NSStackView(views: [titleLabel, messageLabel, button])
+        let stack = NSStackView(views: [titleLabel, messageLabel, NSStackView(views: buttons)])
         stack.orientation = .vertical
         stack.alignment = .leading
         stack.spacing = 12
@@ -69,6 +87,11 @@ enum Alarm {
     }
 
     private final class Closer: NSObject {
+        var action: (() -> Void)?
         @objc func close() { Alarm.dismiss() }
+        @objc func runAction() {
+            Alarm.dismiss()
+            action?()
+        }
     }
 }
