@@ -15,8 +15,17 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
     private var reconnectTimer: Timer?
 
     var onRecordingStopped: ((String) -> Void)?
+    /// RecordStateChanged with outputActive:true — the only proof a recording really runs.
+    var onRecordingStarted: (() -> Void)?
+    /// A request OBS answered with result:false — (requestType, code, comment).
+    var onRequestFailed: ((String, Int, String) -> Void)?
+    /// Peak level (0…1, linear) per input name, from the InputVolumeMeters event (~20/s).
+    var onInputLevels: (([String: Float]) -> Void)?
     var onConnected: (() -> Void)?
     var onError: ((String) -> Void)?
+
+    /// obs-websocket v5: All (non-high-volume) = 0x7FF, InputVolumeMeters = 1 << 16.
+    private let eventSubscriptions = 0x7FF | (1 << 16)
 
     var isConnected: Bool { identified }
 
@@ -64,6 +73,14 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
         send(op: 6, data: ["requestType": "StopRecord", "requestId": UUID().uuidString])
     }
 
+    func setInputMute(_ inputName: String, muted: Bool) {
+        send(op: 6, data: [
+            "requestType": "SetInputMute",
+            "requestId": UUID().uuidString,
+            "requestData": ["inputName": inputName, "inputMuted": muted]
+        ])
+    }
+
     private func send(op: Int, data: [String: Any]) {
         guard identified else {
             onError?("OBS не подключён — команда не отправлена")
@@ -108,13 +125,15 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
             onConnected?()
         case 5: // Event
             handleEvent(obj["d"] as? [String: Any] ?? [:])
+        case 7: // RequestResponse
+            handleResponse(obj["d"] as? [String: Any] ?? [:])
         default:
             break
         }
     }
 
     private func handleHello(_ hello: [String: Any]) {
-        var identify: [String: Any] = ["rpcVersion": 1]
+        var identify: [String: Any] = ["rpcVersion": 1, "eventSubscriptions": eventSubscriptions]
 
         if let authInfo = hello["authentication"] as? [String: Any],
            let challenge = authInfo["challenge"] as? String,
@@ -137,13 +156,38 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
         return sha256Base64(secret + challenge)
     }
 
+    private func handleResponse(_ response: [String: Any]) {
+        guard let status = response["requestStatus"] as? [String: Any],
+              (status["result"] as? Bool) == false else { return }
+        onRequestFailed?(
+            response["requestType"] as? String ?? "?",
+            status["code"] as? Int ?? 0,
+            status["comment"] as? String ?? ""
+        )
+    }
+
     private func handleEvent(_ eventData: [String: Any]) {
         guard let eventType = eventData["eventType"] as? String else { return }
-        if eventType == "RecordStateChanged" {
+        if eventType == "InputVolumeMeters" {
+            guard let inputs = (eventData["eventData"] as? [String: Any])?["inputs"] as? [[String: Any]] else { return }
+            var levels: [String: Float] = [:]
+            for input in inputs {
+                guard let name = input["inputName"] as? String else { continue }
+                // inputLevelsMul: one [magnitude, peak, inputPeak] triple per channel.
+                let channels = input["inputLevelsMul"] as? [[Double]] ?? []
+                levels[name] = Float(channels.compactMap { $0.count > 1 ? $0[1] : nil }.max() ?? 0)
+            }
+            onInputLevels?(levels)
+        } else if eventType == "RecordStateChanged" {
             guard let inner = eventData["eventData"] as? [String: Any],
-                  let outputActive = inner["outputActive"] as? Bool,
-                  outputActive == false,
-                  let path = inner["outputPath"] as? String else { return }
+                  let outputActive = inner["outputActive"] as? Bool else { return }
+            if outputActive {
+                if inner["outputState"] as? String == "OBS_WEBSOCKET_OUTPUT_STARTED" {
+                    onRecordingStarted?()
+                }
+                return
+            }
+            guard let path = inner["outputPath"] as? String else { return }
             onRecordingStopped?(path)
         }
     }
