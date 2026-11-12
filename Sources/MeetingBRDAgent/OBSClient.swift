@@ -61,7 +61,12 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         identified = false
-        onError?("Соединение с OBS разорвано, переподключаюсь…")
+        // obs-websocket close codes: 4009 = AuthenticationFailed (wrong password).
+        if closeCode.rawValue == 4009 {
+            onError?("Неверный пароль WebSocket — сверь obsPassword в конфиге с паролем в OBS")
+        } else {
+            onError?("Соединение с OBS разорвано (код \(closeCode.rawValue)), переподключаюсь…")
+        }
         scheduleReconnect()
     }
 
