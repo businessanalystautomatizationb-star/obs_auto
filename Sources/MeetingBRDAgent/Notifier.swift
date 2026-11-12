@@ -7,11 +7,13 @@ import Foundation
 /// a notification source on this machine (confirmed empty in System Settings → Notifications) —
 /// terminal-notifier ships its own tiny .app bundle, which macOS does register reliably.
 enum Notifier {
-    private static let binaryPath = "/usr/local/bin/terminal-notifier"
+    /// Apple Silicon Homebrew lives in /opt/homebrew, Intel in /usr/local.
+    private static let binaryPath: String? = ["/opt/homebrew/bin/terminal-notifier", "/usr/local/bin/terminal-notifier"]
+        .first { FileManager.default.isExecutableFile(atPath: $0) }
 
     static func send(_ title: String, _ message: String) {
-        guard FileManager.default.isExecutableFile(atPath: binaryPath) else {
-            print("DIAG Notifier: \(binaryPath) not executable/found")
+        guard let binaryPath else {
+            print("DIAG Notifier: terminal-notifier not found (brew install terminal-notifier)")
             return
         }
         let process = Process()

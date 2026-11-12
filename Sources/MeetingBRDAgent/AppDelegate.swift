@@ -130,6 +130,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
         DispatchQueue.main.async { [weak self] in
             guard let self else { return }
             self.statusMenuItem.title = text
+            print("STATUS \(Date()): \(text)")
             // Dedup so a repeated identical message (e.g. the OBS reconnect loop
             // retrying every 5s while OBS is down) doesn't spam the notification center.
             guard text != self.lastNotifiedStatus else { return }

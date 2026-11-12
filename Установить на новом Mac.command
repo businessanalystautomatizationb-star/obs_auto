@@ -34,8 +34,8 @@ fi
 echo "есть: $(brew --version | head -1)"
 
 # 3. ffmpeg, pandoc, OBS
-step "3/7 ffmpeg, pandoc, OBS"
-for p in ffmpeg pandoc; do brew list "$p" >/dev/null 2>&1 || brew install "$p" || fail "не поставился $p"; done
+step "3/7 ffmpeg, pandoc, terminal-notifier, OBS"
+for p in ffmpeg pandoc terminal-notifier; do brew list "$p" >/dev/null 2>&1 || brew install "$p" || fail "не поставился $p"; done
 [ -d "/Applications/OBS.app" ] || brew install --cask obs || fail "OBS не установился"
 echo "готово"
 
