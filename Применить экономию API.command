@@ -18,7 +18,7 @@ else
 fi
 
 echo "== Перезапуск Project Hub =="
-if [ ! -d "$HOME/Проекты/project-hub" ]; then
+if [ ! -f "$HOME/Проекты/project-hub/server.py" ]; then
   echo "Project Hub не установлен на этом Mac — пропускаю"; echo "== ГОТОВО =="; exit 0
 fi
 if launchctl list | grep -q com.btsanalyst.projecthub; then

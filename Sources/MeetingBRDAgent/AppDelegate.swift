@@ -281,7 +281,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
     private func offerProjectHub(docPath: String) {
         let name = (docPath as NSString).lastPathComponent
         // The hub runs under launchd and can't read ~/Documents (macOS privacy) — hand it a copy.
-        let inbox = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Проекты/project-hub/inbox")
+        let hub = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Проекты/project-hub")
+        // Project Hub not installed on this Mac — nothing to offer (and don't create its folders).
+        guard FileManager.default.fileExists(atPath: hub.appendingPathComponent("server.py").path) else { return }
+        let inbox = hub.appendingPathComponent("inbox")
         try? FileManager.default.createDirectory(at: inbox, withIntermediateDirectories: true)
         let copy = inbox.appendingPathComponent(name)
         try? FileManager.default.removeItem(at: copy)
