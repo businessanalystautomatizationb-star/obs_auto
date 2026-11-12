@@ -13,6 +13,9 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
     private var task: URLSessionWebSocketTask?
     private var identified = false
     private var reconnectTimer: Timer?
+    /// Set when we close the connection on purpose (OBS quit after recording) —
+    /// suppresses the error message and the reconnect loop.
+    private var intentionalClose = false
 
     var onRecordingStopped: ((String) -> Void)?
     /// RecordStateChanged with outputActive:true — the only proof a recording really runs.
@@ -41,10 +44,21 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
         reconnectTimer?.invalidate()
         reconnectTimer = nil
         identified = false
+        intentionalClose = false
         guard let url = URL(string: "ws://\(host):\(port)") else { return }
         task = session.webSocketTask(with: url)
         task?.resume()
         receiveLoop()
+    }
+
+    /// Disconnect on purpose before quitting OBS: no error, no reconnect.
+    func disconnect() {
+        intentionalClose = true
+        reconnectTimer?.invalidate()
+        reconnectTimer = nil
+        identified = false
+        task?.cancel(with: .goingAway, reason: nil)
+        task = nil
     }
 
     /// OBS may not be running yet, or may quit/restart mid-session (e.g. while
@@ -61,6 +75,7 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
 
     func urlSession(_ session: URLSession, webSocketTask: URLSessionWebSocketTask, didCloseWith closeCode: URLSessionWebSocketTask.CloseCode, reason: Data?) {
         identified = false
+        if intentionalClose { return }
         // obs-websocket close codes: 4009 = AuthenticationFailed (wrong password).
         if closeCode.rawValue == 4009 {
             onError?("Неверный пароль WebSocket — сверь obsPassword в конфиге с паролем в OBS")
@@ -105,6 +120,7 @@ final class OBSClient: NSObject, URLSessionWebSocketDelegate {
             switch result {
             case .failure(let error):
                 self.identified = false
+                if self.intentionalClose { return }
                 self.onError?("receive error: \(error.localizedDescription)")
                 self.scheduleReconnect()
                 return

@@ -267,6 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.startItem.isEnabled = true
             self.stopItem.isEnabled = false
             self.setStatus("Запись сохранена, закрываю OBS и запускаю обработку…")
+            self.obs.disconnect()
             OBSLauncher.quit()
             self.runPipeline(recordingPath: path)
         }
