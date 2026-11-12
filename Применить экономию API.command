@@ -18,6 +18,9 @@ else
 fi
 
 echo "== Перезапуск Project Hub =="
+if [ ! -d "$HOME/Проекты/project-hub" ]; then
+  echo "Project Hub не установлен на этом Mac — пропускаю"; echo "== ГОТОВО =="; exit 0
+fi
 if launchctl list | grep -q com.btsanalyst.projecthub; then
   launchctl kickstart -k gui/$(id -u)/com.btsanalyst.projecthub && echo "перезапущен через LaunchAgent"
 else

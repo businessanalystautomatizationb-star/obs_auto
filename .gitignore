@@ -2,3 +2,6 @@
 .swiftpm/
 *.xcodeproj
 .DS_Store
+config.json
+install.log
+rebuild.log
