@@ -66,6 +66,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
         menu.addItem(NSMenuItem(title: "Открыть конфиг", action: #selector(openConfig), keyEquivalent: ","))
         menu.addItem(NSMenuItem(title: "Открыть папку с документами", action: #selector(openOutputFolder), keyEquivalent: "o"))
+        menu.addItem(NSMenuItem(title: "Обработать запись заново…", action: #selector(reprocessRecording), keyEquivalent: "p"))
         menu.addItem(NSMenuItem.separator())
         menu.addItem(NSMenuItem(title: "Выход", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q"))
         statusItem.menu = menu
@@ -73,6 +74,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
 
     @objc private func openConfig() {
         NSWorkspace.shared.open(Config.path)
+    }
+
+    /// For recordings whose processing failed (e.g. Claude balance ran out): pick the video,
+    /// the pipeline reuses the saved transcript, so only the Claude step is repeated.
+    @objc private func reprocessRecording() {
+        let panel = NSOpenPanel()
+        panel.title = "Какую запись обработать заново?"
+        panel.directoryURL = FileManager.default.homeDirectoryForCurrentUser.appendingPathComponent("Movies")
+        panel.allowedContentTypes = [.movie, .mpeg4Movie]
+        NSApp.activate(ignoringOtherApps: true)
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        runPipeline(recordingPath: url.path)
+    }
+
+    private func runPipeline(recordingPath: String) {
+        // Ask for the protocol name right away; processing runs in parallel and only
+        // waits for the answer at the final save step.
+        let docName = PendingName()
+        NamePrompt.ask(defaultName: Pipeline.defaultDocName(for: recordingPath),
+                       recordingName: (recordingPath as NSString).lastPathComponent,
+                       into: docName)
+        pipeline.run(recordingPath: recordingPath, docName: docName) { [weak self] message in
+            print("PIPELINE \((recordingPath as NSString).lastPathComponent): \(message)")
+            self?.setStatus(message)
+            if message.hasPrefix("Готово: ") {
+                self?.offerProjectHub(docPath: String(message.dropFirst("Готово: ".count)))
+            } else if message.hasPrefix("Ошибка") {
+                NamePrompt.dismiss()
+                let hint = message.contains("credit balance")
+                    ? "Закончился баланс Anthropic API — пополните его в console.anthropic.com (Plans & Billing)."
+                    : message
+                Alarm.show("Протокол НЕ создан",
+                           "\(hint)\n\nРасшифровка сохранена в папке документов. После исправления: меню агента → «Обработать запись заново…» → выберите \((recordingPath as NSString).lastPathComponent).")
+            }
+        }
     }
 
     @objc private func openOutputFolder() {
@@ -231,12 +267,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate {
             self.stopItem.isEnabled = false
             self.setStatus("Запись сохранена, закрываю OBS и запускаю обработку…")
             OBSLauncher.quit()
-            self.pipeline.run(recordingPath: path) { [weak self] message in
-                self?.setStatus(message)
-                if message.hasPrefix("Готово: ") {
-                    self?.offerProjectHub(docPath: String(message.dropFirst("Готово: ".count)))
-                }
-            }
+            self.runPipeline(recordingPath: path)
         }
         // No obs.connect() here — connecting (and launching OBS) happens lazily in
         // beginRecording() once a meeting is actually detected, so the agent doesn't sit

@@ -1,0 +1,279 @@
+import Foundation
+
+/// Runs the whole "recording finished" -> "document ready" chain.
+/// Everything is synchronous/sequential and runs off the main thread.
+final class Pipeline {
+    private let config: Config
+
+    init(config: Config) {
+        self.config = config
+    }
+
+    func run(recordingPath: String, statusLog: @escaping (String) -> Void) {
+        DispatchQueue.global(qos: .userInitiated).async {
+            do {
+                // The transcript is saved before the Claude step, so a Claude failure (e.g. an
+                // empty API balance) can be retried later without paying Deepgram again.
+                let transcriptPath = "\(self.config.outputFolder)/\(self.baseName(of: recordingPath)).transcript.txt"
+                let transcript: String
+                if let saved = try? String(contentsOfFile: transcriptPath, encoding: .utf8), !saved.isEmpty {
+                    statusLog("Расшифровка уже есть, пропускаю Deepgram…")
+                    transcript = saved
+                } else {
+                    statusLog("Извлекаю аудио…")
+                    let audioPath = try self.extractAudio(from: recordingPath)
+
+                    statusLog("Отправляю на транскрибацию (Deepgram)…")
+                    transcript = try self.transcribe(audioPath: audioPath)
+                    try? FileManager.default.createDirectory(atPath: self.config.outputFolder, withIntermediateDirectories: true)
+                    try transcript.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
+                }
+
+                statusLog("Анализирую транскрипт (Claude)…")
+                let document = try self.analyze(transcript: transcript)
+
+                statusLog("Сохраняю документ…")
+                let outPath = try self.saveDocument(document, sourceRecording: recordingPath)
+
+                statusLog("Готово: \(outPath)")
+                NSWorkspaceOpener.reveal(path: outPath)
+            } catch {
+                statusLog("Ошибка пайплайна: \(error.localizedDescription)")
+            }
+        }
+    }
+
+    // MARK: - Step 1: ffmpeg audio extraction
+
+    private func extractAudio(from videoPath: String) throws -> String {
+        let audioPath = (videoPath as NSString).deletingPathExtension + ".m4a"
+        if FileManager.default.fileExists(atPath: audioPath) {
+            try? FileManager.default.removeItem(atPath: audioPath)
+        }
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: try which("ffmpeg"))
+        // Mono/16kHz/64kbps — plenty for speech-to-text (Deepgram et al. train on 16kHz),
+        // and a much smaller upload than the original stereo/128kbps. A large meeting
+        // recording over a slow/VPN-throttled connection was hitting Deepgram's upload
+        // timeout (HTTP 408 SLOW_UPLOAD) at the previous size.
+        process.arguments = [
+            "-y", "-nostdin", "-i", videoPath,
+            "-vn", "-acodec", "aac", "-ac", "1", "-ar", "16000", "-b:a", "64k",
+            audioPath
+        ]
+        // Without an explicit stdin, ffmpeg can block waiting for terminal input when run
+        // from a background/non-interactive process (as happens via LaunchAgent) — hangs
+        // indefinitely with 0% CPU instead of failing. -nostdin plus a null stdin closes
+        // that off completely.
+        process.standardInput = FileHandle.nullDevice
+        let stderrPipe = Pipe()
+        process.standardError = stderrPipe
+        try process.run()
+        process.waitUntilExit()
+
+        guard process.terminationStatus == 0 else {
+            let errData = stderrPipe.fileHandleForReading.readDataToEndOfFile()
+            let errText = String(data: errData, encoding: .utf8) ?? "unknown ffmpeg error"
+            throw PipelineError.step("ffmpeg failed: \(errText)")
+        }
+        return audioPath
+    }
+
+    private func which(_ tool: String) throws -> String {
+        for dir in ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin"] {
+            let candidate = "\(dir)/\(tool)"
+            if FileManager.default.isExecutableFile(atPath: candidate) { return candidate }
+        }
+        throw PipelineError.step("\(tool) not found — install with `brew install \(tool)`")
+    }
+
+    // MARK: - Step 2: Deepgram transcription
+
+    /// Deepgram's pre-recorded endpoint is synchronous (no upload+poll dance): the file goes
+    /// straight in the request body and the response holds the finished transcript.
+    private func transcribe(audioPath: String) throws -> String {
+        let data = try Data(contentsOf: URL(fileURLWithPath: audioPath))
+
+        var components = URLComponents(string: "https://api.deepgram.com/v1/listen")!
+        components.queryItems = [
+            URLQueryItem(name: "model", value: "nova-2"),
+            URLQueryItem(name: "detect_language", value: "true"),
+            URLQueryItem(name: "smart_format", value: "true"),
+            URLQueryItem(name: "punctuate", value: "true"),
+            URLQueryItem(name: "diarize", value: "true"),
+            URLQueryItem(name: "paragraphs", value: "true")
+        ]
+
+        var request = URLRequest(url: components.url!)
+        request.httpMethod = "POST"
+        // Long meetings can take several minutes to transcribe; the request stays open
+        // the whole time since this endpoint is synchronous, so use a generous timeout.
+        request.timeoutInterval = 3600
+        request.setValue("Token \(config.deepgramKey)", forHTTPHeaderField: "Authorization")
+        request.setValue("audio/mp4", forHTTPHeaderField: "Content-Type")
+        request.httpBody = data
+
+        let respData = try requestWithRetry(request, context: "Deepgram transcribe")
+        let json = try JSONSerialization.jsonObject(with: respData) as? [String: Any]
+        return try formatDeepgramTranscript(json)
+    }
+
+    private func formatDeepgramTranscript(_ json: [String: Any]?) throws -> String {
+        guard let results = json?["results"] as? [String: Any],
+              let channels = results["channels"] as? [[String: Any]],
+              let alternative = channels.first?["alternatives"] as? [[String: Any]],
+              let firstAlt = alternative.first else {
+            throw PipelineError.step("Deepgram transcribe: unexpected response shape")
+        }
+
+        if let paragraphs = firstAlt["paragraphs"] as? [String: Any],
+           let transcript = paragraphs["transcript"] as? String,
+           !transcript.isEmpty {
+            return transcript
+        }
+        return (firstAlt["transcript"] as? String) ?? ""
+    }
+
+    // MARK: - Step 3: Claude analysis
+
+    private func analyze(transcript: String) throws -> String {
+        var request = URLRequest(url: URL(string: "https://api.anthropic.com/v1/messages")!)
+        request.httpMethod = "POST"
+        // Long transcripts mean a long generation time; the default 60s request timeout
+        // (and some VPNs' idle-connection cutoff) can kill the request before Claude
+        // finishes responding — same fix as the Deepgram request below.
+        request.timeoutInterval = 3600
+        request.setValue(config.anthropicKey, forHTTPHeaderField: "x-api-key")
+        request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
+        request.setValue("application/json", forHTTPHeaderField: "content-type")
+
+        let body: [String: Any] = [
+            "model": "claude-sonnet-5",
+            "max_tokens": 8192,
+            "system": PromptTemplates.systemPrompt(),
+            "messages": [["role": "user", "content": transcript]]
+        ]
+        request.httpBody = try JSONSerialization.data(withJSONObject: body)
+
+        let respData = try requestWithRetry(request, context: "Claude analyze")
+        let json = try JSONSerialization.jsonObject(with: respData) as? [String: Any]
+
+        if let stopReason = json?["stop_reason"] as? String, stopReason == "refusal" {
+            throw PipelineError.step("Claude отказался анализировать этот транскрипт (stop_reason: refusal)")
+        }
+        // Sonnet 5 thinks by default, so content[] often starts with a "thinking" block
+        // before the "text" block — find the text block by type, don't assume it's first.
+        guard let content = json?["content"] as? [[String: Any]],
+              let textBlock = content.first(where: { ($0["type"] as? String) == "text" }),
+              let text = textBlock["text"] as? String else {
+            let raw = String(data: respData, encoding: .utf8) ?? "<non-utf8 body>"
+            throw PipelineError.step("Claude response missing content text — raw response: \(raw)")
+        }
+        return text
+    }
+
+    // MARK: - Step 4: save document
+
+    private func baseName(of recordingPath: String) -> String {
+        (recordingPath as NSString).lastPathComponent
+            .replacingOccurrences(of: (recordingPath as NSString).pathExtension, with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
+    private func saveDocument(_ markdown: String, sourceRecording: String) throws -> String {
+        let fm = FileManager.default
+        try? fm.createDirectory(atPath: config.outputFolder, withIntermediateDirectories: true)
+
+        let baseName = baseName(of: sourceRecording)
+        let mdPath = "\(config.outputFolder)/\(baseName).md"
+        try markdown.write(toFile: mdPath, atomically: true, encoding: .utf8)
+
+        if let pandoc = try? which("pandoc") {
+            let docxPath = "\(config.outputFolder)/\(baseName).docx"
+            let process = Process()
+            process.executableURL = URL(fileURLWithPath: pandoc)
+            process.arguments = [mdPath, "-o", docxPath]
+            process.standardInput = FileHandle.nullDevice
+            try? process.run()
+            process.waitUntilExit()
+            if process.terminationStatus == 0, fm.fileExists(atPath: docxPath) {
+                return docxPath
+            }
+        }
+        return mdPath
+    }
+
+    // MARK: - HTTP helpers
+
+    /// Retries a handful of times, with backoff, on both transport-level failures (dropped
+    /// connection, timeout, DNS hiccup — what a flaky VPN produces mid-upload) and specific
+    /// retryable HTTP status codes (408 request-timeout — e.g. Deepgram's SLOW_UPLOAD on a
+    /// throttled connection — 429, and 5xx). Other HTTP error codes are not retried.
+    private func requestWithRetry(_ request: URLRequest, context: String, maxAttempts: Int = 4) throws -> Data {
+        let retryableURLErrorCodes: Set<Int> = [
+            NSURLErrorNetworkConnectionLost,
+            NSURLErrorTimedOut,
+            NSURLErrorNotConnectedToInternet,
+            NSURLErrorCannotConnectToHost,
+            NSURLErrorCannotFindHost,
+            NSURLErrorDNSLookupFailed
+        ]
+        let retryableHTTPStatusCodes: Set<Int> = [408, 429, 500, 502, 503, 504]
+
+        var attempt = 1
+        while true {
+            do {
+                let (data, response) = try singleRequest(request)
+                let statusCode = (response as? HTTPURLResponse)?.statusCode ?? 200
+                if !(200...299).contains(statusCode), retryableHTTPStatusCodes.contains(statusCode), attempt < maxAttempts {
+                    Thread.sleep(forTimeInterval: Double(attempt) * 5) // 5s, 10s, 15s
+                    attempt += 1
+                    continue
+                }
+                try checkHTTP(response, data, context: context)
+                return data
+            } catch {
+                let nsError = error as NSError
+                let retryable = nsError.domain == NSURLErrorDomain && retryableURLErrorCodes.contains(nsError.code)
+                guard retryable, attempt < maxAttempts else { throw error }
+                Thread.sleep(forTimeInterval: Double(attempt) * 5)
+                attempt += 1
+            }
+        }
+    }
+
+    private func singleRequest(_ request: URLRequest) throws -> (Data, URLResponse) {
+        var result: Result<(Data, URLResponse), Error>!
+        let semaphore = DispatchSemaphore(value: 0)
+        URLSession.shared.dataTask(with: request) { data, response, error in
+            if let error {
+                result = .failure(error)
+            } else if let data, let response {
+                result = .success((data, response))
+            } else {
+                result = .failure(PipelineError.step("empty response"))
+            }
+            semaphore.signal()
+        }.resume()
+        semaphore.wait()
+        return try result.get()
+    }
+
+    private func checkHTTP(_ response: URLResponse, _ data: Data, context: String) throws {
+        guard let http = response as? HTTPURLResponse, (200...299).contains(http.statusCode) else {
+            let bodyText = String(data: data, encoding: .utf8) ?? ""
+            let code = (response as? HTTPURLResponse)?.statusCode ?? -1
+            throw PipelineError.step("\(context) failed (HTTP \(code)): \(bodyText)")
+        }
+    }
+}
+
+enum PipelineError: LocalizedError {
+    case step(String)
+    var errorDescription: String? {
+        switch self {
+        case .step(let message): return message
+        }
+    }
+}

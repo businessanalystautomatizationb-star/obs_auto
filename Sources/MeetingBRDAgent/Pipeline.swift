@@ -9,20 +9,41 @@ final class Pipeline {
         self.config = config
     }
 
-    func run(recordingPath: String, statusLog: @escaping (String) -> Void) {
+    /// `docName` — the protocol name the user is typing meanwhile; nil (CLI mode) or an
+    /// empty answer → the protocol is named after the recording file, as before.
+    func run(recordingPath: String, docName: PendingName? = nil, statusLog: @escaping (String) -> Void) {
         DispatchQueue.global(qos: .userInitiated).async {
             do {
-                statusLog("Извлекаю аудио…")
-                let audioPath = try self.extractAudio(from: recordingPath)
+                // The transcript is saved before the Claude step, so a Claude failure (e.g. an
+                // empty API balance) can be retried later without paying Deepgram again.
+                let transcriptPath = "\(self.config.outputFolder)/\(self.baseName(of: recordingPath)).transcript.txt"
+                let transcript: String
+                if let saved = try? String(contentsOfFile: transcriptPath, encoding: .utf8), !saved.isEmpty {
+                    statusLog("Расшифровка уже есть, пропускаю Deepgram…")
+                    transcript = saved
+                } else {
+                    statusLog("Извлекаю аудио…")
+                    let audioPath = try self.extractAudio(from: recordingPath)
 
-                statusLog("Отправляю на транскрибацию (Deepgram)…")
-                let transcript = try self.transcribe(audioPath: audioPath)
+                    statusLog("Отправляю на транскрибацию (Deepgram)…")
+                    transcript = try self.transcribe(audioPath: audioPath)
+                    try? FileManager.default.createDirectory(atPath: self.config.outputFolder, withIntermediateDirectories: true)
+                    try transcript.write(toFile: transcriptPath, atomically: true, encoding: .utf8)
+                }
 
                 statusLog("Анализирую транскрипт (Claude)…")
                 let document = try self.analyze(transcript: transcript)
 
+                var chosenName: String?
+                if let docName {
+                    if !docName.isResolved {
+                        statusLog("Протокол готов — жду название в открытом окне…")
+                    }
+                    chosenName = docName.wait()
+                }
+
                 statusLog("Сохраняю документ…")
-                let outPath = try self.saveDocument(document, sourceRecording: recordingPath)
+                let outPath = try self.saveDocument(document, sourceRecording: recordingPath, name: chosenName)
 
                 statusLog("Готово: \(outPath)")
                 NSWorkspaceOpener.reveal(path: outPath)
@@ -137,9 +158,12 @@ final class Pipeline {
         request.setValue("2023-06-01", forHTTPHeaderField: "anthropic-version")
         request.setValue("application/json", forHTTPHeaderField: "content-type")
 
+        // Cost control: Sonnet 5 thinks by default and thinking is billed as output
+        // tokens. A meeting protocol is a summarization task, so thinking is off.
         let body: [String: Any] = [
             "model": "claude-sonnet-5",
-            "max_tokens": 8192,
+            "max_tokens": 4096,
+            "thinking": ["type": "disabled"],
             "system": PromptTemplates.systemPrompt(),
             "messages": [["role": "user", "content": transcript]]
         ]
@@ -159,18 +183,54 @@ final class Pipeline {
             let raw = String(data: respData, encoding: .utf8) ?? "<non-utf8 body>"
             throw PipelineError.step("Claude response missing content text — raw response: \(raw)")
         }
+        if let stopReason = json?["stop_reason"] as? String, stopReason == "max_tokens" {
+            return text + "\n\n> ⚠️ Протокол обрезан по лимиту длины (max_tokens в Pipeline.swift)."
+        }
         return text
     }
 
     // MARK: - Step 4: save document
 
-    private func saveDocument(_ markdown: String, sourceRecording: String) throws -> String {
+    private func baseName(of recordingPath: String) -> String {
+        (recordingPath as NSString).lastPathComponent
+            .replacingOccurrences(of: (recordingPath as NSString).pathExtension, with: "")
+            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+    }
+
+    /// Default text for the name prompt: the meeting date (when the recording was made,
+    /// not today — matters for «Обработать запись заново…»), then a space to type after.
+    static func defaultDocName(for recordingPath: String) -> String {
+        let attrs = try? FileManager.default.attributesOfItem(atPath: recordingPath)
+        let date = (attrs?[.creationDate] as? Date) ?? Date()
+        let formatter = DateFormatter()
+        formatter.dateFormat = "yyyy-MM-dd"
+        return formatter.string(from: date) + " "
+    }
+
+    /// Makes the user's text safe as a file name and never overwrites an existing protocol:
+    /// «2026-11-10 Проект А» → «2026-11-10 Проект А (2)» if that name is already taken.
+    private func uniqueBaseName(_ raw: String) -> String {
+        var name = raw.replacingOccurrences(of: "/", with: "-")
+            .replacingOccurrences(of: ":", with: "-")
+            .replacingOccurrences(of: "\n", with: " ")
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+        while name.hasPrefix(".") { name.removeFirst() } // a leading dot = hidden file
+        if name.count > 150 { name = String(name.prefix(150)) }
+        let taken: (String) -> Bool = { candidate in
+            ["md", "docx"].contains { FileManager.default.fileExists(atPath: "\(self.config.outputFolder)/\(candidate).\($0)") }
+        }
+        guard taken(name) else { return name }
+        var counter = 2
+        while taken("\(name) (\(counter))") { counter += 1 }
+        return "\(name) (\(counter))"
+    }
+
+    private func saveDocument(_ markdown: String, sourceRecording: String, name: String?) throws -> String {
         let fm = FileManager.default
         try? fm.createDirectory(atPath: config.outputFolder, withIntermediateDirectories: true)
 
-        let baseName = (sourceRecording as NSString).lastPathComponent
-            .replacingOccurrences(of: (sourceRecording as NSString).pathExtension, with: "")
-            .trimmingCharacters(in: CharacterSet(charactersIn: "."))
+        let cleaned = name.map { uniqueBaseName($0) } ?? ""
+        let baseName = cleaned.isEmpty ? baseName(of: sourceRecording) : cleaned
         let mdPath = "\(config.outputFolder)/\(baseName).md"
         try markdown.write(toFile: mdPath, atomically: true, encoding: .utf8)
 
